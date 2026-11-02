@@ -1,10 +1,14 @@
-*! stpaf 0.4.0  02nov2026
+*! stpaf 0.5.1  03nov2026
 *! Population attributable fraction after stcox (Cox / LWYY) with time-varying covariates.
 *! Influence-function (sandwich) confidence intervals, or an exact cluster jackknife (vce(jackknife)).
 *! 0.3.0: cluster() option; error for ghoshlin data without clusters
 *! 0.3.1: vce(jackknife) failed for unstratified models (_stpaf_recode returned a row vector)
 *! 0.4.0: fast jackknife: leave-one-cluster-out Breslow fits by Newton-Raphson in Mata (warm start
 *!        from e(b), switch off with nowarm); options refit (stcox refits, as before) and nowarm
+*! 0.5.0: vce(jackknife) is the default with fewer than 100 clusters (influence function if it
+*!        fails); clusters whose Newton fit fails are refitted by stcox instead of stopping;
+*!        weighted models with efron/exact ties use stcox refits; refit/nowarm imply vce(jackknife)
+*! 0.5.1: a failing default jackknife no longer prints the Mata error trace (only the note)
 
 program define stpaf, rclass
     version 15.0
@@ -35,16 +39,29 @@ program define stpaf, rclass
     }
     local logci = ("`citrans'" == "log")
     // variance: influence function (default) or exact cluster jackknife
+    // no vce(): decided once the clusters are known (jackknife with fewer than 100 clusters)
     local vce = strtrim("`vce'")
-    if inlist("`vce'", "", "if", "influence", "robust") local vce "if"
+    local vcedef 0
+    if "`vce'" == "" {
+        local vcedef 1
+        local vce "if"
+    }
+    else if inlist("`vce'", "if", "influence", "robust") local vce "if"
     else if inlist("`vce'", "jackknife", "jack", "jackk", "jackkn", "jackkni", "jackknif") local vce "jackknife"
     else {
-        di as err "vce() must be {bf:if} (influence function, the default) or {bf:jackknife}"
+        di as err "vce() must be {bf:if} (influence function) or {bf:jackknife}"
         exit 198
     }
-    if "`vce'" != "jackknife" & ("`refit'" != "" | "`warm'" != "") {
-        di as err "options {bf:refit} and {bf:nowarm} require {bf:vce(jackknife)}"
-        exit 198
+    // refit and nowarm are jackknife options: without vce() they request the jackknife
+    if "`refit'" != "" | "`warm'" != "" {
+        if `vcedef' {
+            local vce "jackknife"
+            local vcedef 0
+        }
+        else if "`vce'" != "jackknife" {
+            di as err "options {bf:refit} and {bf:nowarm} require {bf:vce(jackknife)}"
+            exit 198
+        }
     }
     if "`refit'" != "" & "`warm'" != "" {
         di as err "options {bf:refit} and {bf:nowarm} may not be combined ({bf:stcox} refits always start from zero)"
@@ -197,8 +214,18 @@ program define stpaf, rclass
     }
     // frequency weights with one cluster per record: each record stands for w independent units
     local fwrep = ("`wtype'" == "fweight" & "`clv'" == "")
+    // default variance: cluster jackknife with fewer than 100 clusters (the influence-function
+    // CI is too narrow there), otherwise the influence function
+    local jkdefault 0
+    if `vcedef' {
+        qui summarize `clus' if `esamp', meanonly
+        if r(max) < 100 & !`fwrep' {
+            local vce "jackknife"
+            local jkdefault 1
+        }
+    }
     if `fwrep' & "`vce'" == "jackknife" {
-        di as err "vce(jackknife) is not available with fweights and no clustering; use the default vce(if)"
+        di as err "vce(jackknife) is not available with fweights and no clustering; use vce(if)"
         exit 198
     }
     if "`wtype'" != "" & "`clv'" == "" & "`wtype'" != "fweight" {
@@ -280,60 +307,91 @@ program define stpaf, rclass
     // sample (same terms, strata and stset weights); the PAFs of the reduced samples
     // give the jackknife variance of log(1-PAF) and of PAF, which replaces the
     // influence-function one.
-    // Default (Breslow ties, or no tied failure times): Newton-Raphson for the Breslow
-    // partial likelihood in Mata, the left-out cluster given zero weight, started from
-    // e(b) (nowarm: from 0) and iterated until mreldif(b) <= 1e-12 and U'I^-1U <= 1e-12,
-    // i.e. to convergence independent of the starting values.
-    // Option refit, or efron/exact ties with tied failure times: stcox refits.
+    // Default (Breslow ties, or an unweighted model without tied failure times):
+    // Newton-Raphson for the Breslow partial likelihood in Mata, the left-out cluster given
+    // zero weight, started from e(b) (nowarm: from 0) and iterated until mreldif(b) <= 1e-12
+    // and U'I^-1U <= 1e-12, i.e. to convergence independent of the starting values.
+    // Clusters whose Newton fit fails (singular information, no convergence) are refitted
+    // by stcox. Option refit, efron/exact ties with tied failure times, and weighted
+    // models with efron/exact ties: stcox refits for all clusters.
+    // When the jackknife was chosen by default (fewer than 100 clusters) and fails, the
+    // influence-function results are kept.
     local jkmeth ""
     local jkit = .
+    local jknref 0
+    local jkfail 0
     if !`rc' & "`vce'" == "jackknife" {
         local G0 = `ST'[1, 1]
         local jkmeth "refit"
+        local full 1
+        tempname JKI JKNF JKF
+        capture mata: mata drop __stpaf_PF
+        // a jackknife chosen by default falls back to the influence function on error, so its
+        // Mata error messages are not shown (noisily would also override quietly)
+        local capn = cond(`jkdefault', "capture", "capture noisily")
         if "`refit'" == "" {
             local brestie = inlist("`e(ties)'", "breslow", "")
             local dowarm = ("`warm'" == "")
-            tempname JKI
-            capture noisily mata: _stpaf_jackfast(st_data(., tokens("`xvars'"), "`esamp'"), ///
-                st_data(., "_t0", "`esamp'"), st_data(., "_t", "`esamp'"), ///
-                st_data(., "_d", "`esamp'"), st_data(., "`touse'", "`esamp'"), ///
-                st_data(., "`wvar'", "`esamp'"), ///
-                st_data(., "`clus'", "`esamp'"), st_data(., "`strat'", "`esamp'"), ///
-                st_matrix("`bk'"), `nsc', (`tauvec'), `level', `logci', "`TAB'", ///
-                `dowarm', `brestie', "`JKI'")
-            local rc = _rc
-            if !`rc' {
-                if scalar(`JKI') >= 0 {
-                    local jkmeth = cond(`dowarm', "newton", "newton, nowarm")
-                    local jkit = scalar(`JKI')
-                }
-                else {
-                    di as txt "note: tied failure times with {bf:`e(ties)'} ties; the jackknife refits {bf:stcox}"
-                    if "`warm'" != "" di as txt "      (option nowarm has no effect)"
+            if !`brestie' & "`wtype'" != "" {
+                // defensive: stcox 19 allows no weights with efron (cert 12d); if a weighted
+                // efron/exact fit occurs, fweights > 1 imply tied failures that a count of
+                // failure records cannot see, so refit with the model's own ties
+                di as txt "note: weighted model with {bf:`e(ties)'} ties; the jackknife refits {bf:stcox}"
+                if "`warm'" != "" di as txt "      (option nowarm has no effect)"
+            }
+            else {
+                `capn' mata: _stpaf_jackfast(st_data(., tokens("`xvars'"), "`esamp'"), ///
+                    st_data(., "_t0", "`esamp'"), st_data(., "_t", "`esamp'"), ///
+                    st_data(., "_d", "`esamp'"), st_data(., "`touse'", "`esamp'"), ///
+                    st_data(., "`wvar'", "`esamp'"), ///
+                    st_data(., "`clus'", "`esamp'"), st_data(., "`strat'", "`esamp'"), ///
+                    st_matrix("`bk'"), `nsc', (`tauvec'), `level', `logci', "`TAB'", ///
+                    `dowarm', `brestie', "`JKI'", "`JKNF'", "`JKF'")
+                local rc = _rc
+                if !`rc' {
+                    if scalar(`JKI') >= 0 {
+                        local jkmeth = cond(`dowarm', "newton", "newton, nowarm")
+                        local jkit = scalar(`JKI')
+                        local jknref = scalar(`JKNF')
+                        local full 0
+                        if `jknref' > 0 {
+                            di as txt "note: the Newton fit failed for `jknref' of `G0' left-out clusters" ///
+                                " (singular information or no convergence);"
+                            di as txt "      {bf:stcox} is refitted for " cond(`jknref' == 1, "that cluster", "these clusters")
+                        }
+                    }
+                    else {
+                        di as txt "note: tied failure times with {bf:`e(ties)'} ties; the jackknife refits {bf:stcox}"
+                        if "`warm'" != "" di as txt "      (option nowarm has no effect)"
+                    }
                 }
             }
         }
-        if !`rc' & "`jkmeth'" == "refit" {
+        // stcox refits: all clusters (full) or those whose Newton fit failed (JKF)
+        local nref = cond(`full', `G0', `jknref')
+        if !`rc' & `nref' > 0 {
             local ties "`e(ties)'"
             if !inlist("`ties'", "breslow", "efron", "exactm", "exactp") local ties "breslow"
             local stopt = cond("`strv'" == "", "", "strata(`strv')")
             tempname BJ H
-            matrix `BJ' = J(`G0', `p', .)
+            matrix `BJ' = J(`nref', `p', .)
             _estimates hold `H', restore
             if "`nodots'" == "" {
-                _dots 0, title(Jackknife replications) reps(`G0')
+                _dots 0, title(Jackknife replications) reps(`nref')
             }
-            forvalues g = 1/`G0' {
+            forvalues i = 1/`nref' {
+                if `full' local g `i'
+                else local g = `JKF'[`i', 1]
                 capture quietly stcox `fvl' if `esamp' & `clus' != `g', `stopt' `ties'
                 local rcg = _rc
                 if !`rcg' {
-                    local i 0
+                    local j 0
                     foreach t of local fvl {
-                        local ++i
-                        matrix `BJ'[`g', `i'] = _b[`t']
+                        local ++j
+                        matrix `BJ'[`i', `j'] = _b[`t']
                     }
                 }
-                if "`nodots'" == "" _dots `g' `rcg'
+                if "`nodots'" == "" _dots `i' `rcg'
                 if `rcg' {
                     di
                     di as err "stcox failed when cluster `g' of `G0' was left out (rc = `rcg')"
@@ -344,14 +402,35 @@ program define stpaf, rclass
             if "`nodots'" == "" di
             _estimates unhold `H'
             if !`rc' {
-                capture noisily mata: _stpaf_jack(st_data(., tokens("`xvars'"), "`esamp'"), ///
-                    st_data(., "_t0", "`esamp'"), st_data(., "_t", "`esamp'"), ///
-                    st_data(., "_d", "`esamp'"), st_data(., "`touse'", "`esamp'"), ///
-                    st_data(., "`wvar'", "`esamp'"), ///
-                    st_data(., "`clus'", "`esamp'"), st_data(., "`strat'", "`esamp'"), ///
-                    st_matrix("`BJ'"), `nsc', (`tauvec'), `level', `logci', "`TAB'")
+                if `full' {
+                    `capn' mata: _stpaf_jack(st_data(., tokens("`xvars'"), "`esamp'"), ///
+                        st_data(., "_t0", "`esamp'"), st_data(., "_t", "`esamp'"), ///
+                        st_data(., "_d", "`esamp'"), st_data(., "`touse'", "`esamp'"), ///
+                        st_data(., "`wvar'", "`esamp'"), ///
+                        st_data(., "`clus'", "`esamp'"), st_data(., "`strat'", "`esamp'"), ///
+                        st_matrix("`BJ'"), `nsc', (`tauvec'), `level', `logci', "`TAB'")
+                }
+                else {
+                    `capn' mata: _stpaf_jackfill(st_data(., tokens("`xvars'"), "`esamp'"), ///
+                        st_data(., "_t0", "`esamp'"), st_data(., "_t", "`esamp'"), ///
+                        st_data(., "_d", "`esamp'"), st_data(., "`touse'", "`esamp'"), ///
+                        st_data(., "`wvar'", "`esamp'"), ///
+                        st_data(., "`clus'", "`esamp'"), st_data(., "`strat'", "`esamp'"), ///
+                        st_matrix("`BJ'"), st_matrix("`JKF'"), `nsc', (`tauvec'), `level', `logci', "`TAB'")
+                }
                 local rc = _rc
             }
+        }
+        capture mata: mata drop __stpaf_PF
+        // a jackknife chosen by default must not stop stpaf: keep the influence function
+        if `rc' & `rc' != 1 & `jkdefault' {
+            di as txt "note: the cluster jackknife (default with fewer than 100 clusters) failed (rc = `rc');"
+            di as txt "      standard errors from the influence function are reported instead"
+            local rc 0
+            local vce "if"
+            local jkfail 1
+            local jkmeth ""
+            local jknref 0
         }
     }
     forvalues j = 1/`nsc' {
@@ -385,10 +464,16 @@ program define stpaf, rclass
     }
     if "`vce'" == "jackknife" {
         if "`jkmeth'" == "refit" local jkdesc "`G' stcox refits"
-        else local jkdesc = "`G' Newton fits, " + cond("`warm'" == "", "warm start", "cold start") + ///
-            ", mean " + string(`jkit', "%4.2f") + " iterations"
+        else {
+            local jkdesc = "`=`G'-`jknref'' Newton fits, " + cond("`warm'" == "", "warm start", "cold start") + ///
+                ", mean " + string(`jkit', "%4.2f") + " iterations"
+            if `jknref' > 0 local jkdesc = "`jkdesc', `jknref' stcox refit" + cond(`jknref' > 1, "s", "")
+        }
         di as txt "Std. err. from the cluster jackknife (" as res "`jkdesc'" as txt "), clusters: " ///
             as res cond("`clv'" == "", "record", "`clv'") as txt " (`clsrc')"
+        if `jkdefault' {
+            di as txt "(the jackknife is the default with fewer than 100 clusters; {bf:vce(if)} gives the influence function)"
+        }
     }
     else {
         di as txt "Std. err. from the influence function, clustered on " ///
@@ -412,9 +497,9 @@ program define stpaf, rclass
     if "`citrans'" == "log" {
         di as txt "CI is computed on the log(1-PAF) scale and back-transformed."
     }
-    if "`vce'" == "if" & `G' < 100 {
+    if "`vce'" == "if" & `G' < 100 & !`jkfail' & !`fwrep' {
         di as txt "Note: with fewer than 100 clusters the influence-function CI tends to be too narrow;"
-        di as txt "      consider {bf:vce(jackknife)}."
+        di as txt "      {bf:vce(jackknife)}, the default in this case, is recommended."
     }
     if `maxsc' > 1e-4 & "`vce'" == "if" {
         di as txt "Note: standardized partial-likelihood score at e(b) = " %9.2g `maxsc' ///
@@ -443,7 +528,10 @@ program define stpaf, rclass
     return local clustvar "`clv'"
     if "`vce'" == "jackknife" {
         return local jk_method "`jkmeth'"
-        if "`jkmeth'" != "refit" return scalar jk_iter = `jkit'
+        if "`jkmeth'" != "refit" {
+            return scalar jk_iter = `jkit'
+            return scalar jk_nrefit = `jknref'
+        }
     }
     return local cmd "stpaf"
 end
@@ -904,6 +992,36 @@ real colvector _stpaf_recode(real colvector v)
     return(map[v, 1])
 }
 
+// refit path: replicate PAFs (one row per cluster in cl, columns in the row order of TAB)
+// from the coefficients refitted by stcox without that cluster (row i of BJ for cl[i])
+real matrix _stpaf_jkrefit(real matrix X, real colvector t0, real colvector t1, real colvector d,
+    real colvector g, real colvector w, real colvector clus, real colvector strat,
+    real matrix BJ, real colvector cl, real scalar nsc, real rowvector tau, real scalar level,
+    real scalar logci)
+{
+    struct stpaf_dat scalar D
+    pointer(real matrix) scalar pX
+    real matrix PF, res
+    real colvector ii
+    real scalar nt, i, gg, j
+
+    nt = cols(tau)
+    PF = J(rows(cl), nsc*nt, .)
+    for (i = 1; i <= rows(cl); i++) {
+        gg = cl[i]
+        ii = selectindex(clus :!= gg)
+        D = _stpaf_prep(X[ii,.], t0[ii], t1[ii], d[ii], g[ii], w[ii],
+            _stpaf_recode(clus[ii]), _stpaf_recode(strat[ii]), BJ[i,.])
+        for (j = 1; j <= nsc; j++) {
+            pX = findexternal("__stpaf_Xc" + strofreal(j))
+            if (pX == NULL) _error("stpaf internal error: counterfactual design matrix not found")
+            res = _stpaf_scen(D, (*pX)[ii,.], tau, level, logci, 0)
+            PF[i, ((j-1)*nt+1)..(j*nt)] = res[.,2]'
+        }
+    }
+    return(PF)
+}
+
 // exact cluster jackknife, refit path: BJ holds the coefficients refitted by stcox
 // without cluster g (row g); the PAFs of the reduced samples replace the IF-based SEs
 void _stpaf_jack(real matrix X, real colvector t0, real colvector t1, real colvector d,
@@ -911,26 +1029,28 @@ void _stpaf_jack(real matrix X, real colvector t0, real colvector t1, real colve
     real matrix BJ, real scalar nsc, real rowvector tau, real scalar level,
     real scalar logci, string scalar tabname)
 {
-    struct stpaf_dat scalar D
-    pointer(real matrix) scalar pX
-    real matrix PF, res
-    real colvector ii
-    real scalar G, nt, gg, j
+    real matrix PF
 
-    G  = rows(BJ)
-    nt = cols(tau)
-    PF = J(G, nsc*nt, .)
-    for (gg = 1; gg <= G; gg++) {
-        ii = selectindex(clus :!= gg)
-        D = _stpaf_prep(X[ii,.], t0[ii], t1[ii], d[ii], g[ii], w[ii],
-            _stpaf_recode(clus[ii]), _stpaf_recode(strat[ii]), BJ[gg,.])
-        for (j = 1; j <= nsc; j++) {
-            pX = findexternal("__stpaf_Xc" + strofreal(j))
-            if (pX == NULL) _error("stpaf internal error: counterfactual design matrix not found")
-            res = _stpaf_scen(D, (*pX)[ii,.], tau, level, logci, 0)
-            PF[gg, ((j-1)*nt+1)..(j*nt)] = res[.,2]'
-        }
-    }
+    PF = _stpaf_jkrefit(X, t0, t1, d, g, w, clus, strat, BJ, (1::rows(BJ)), nsc, tau,
+        level, logci)
+    _stpaf_jkvar(PF, level, logci, tabname)
+}
+
+// fast jackknife with failed Newton fits: the replicate PAFs of the other clusters are in
+// the external __stpaf_PF; those of the clusters cl come from the stcox refits BJ
+void _stpaf_jackfill(real matrix X, real colvector t0, real colvector t1, real colvector d,
+    real colvector g, real colvector w, real colvector clus, real colvector strat,
+    real matrix BJ, real colvector cl, real scalar nsc, real rowvector tau, real scalar level,
+    real scalar logci, string scalar tabname)
+{
+    pointer() scalar pPF
+    real matrix PF
+
+    pPF = findexternal("__stpaf_PF")
+    if (pPF == NULL) _error("stpaf internal error: replicate PAFs of the Newton jackknife not found")
+    PF = *pPF
+    if (rows(BJ) != rows(cl)) _error("stpaf internal error: refitted clusters do not match")
+    PF[cl, .] = _stpaf_jkrefit(X, t0, t1, d, g, w, clus, strat, BJ, cl, nsc, tau, level, logci)
     _stpaf_jkvar(PF, level, logci, tabname)
 }
 
@@ -1164,9 +1284,11 @@ void _stpaf_jkll(struct stpaf_jk scalar JK, real matrix X, real colvector w, rea
 
 // Newton-Raphson with step halving; converged when mreldif(b, previous b) <= 1e-12
 // and U*I^-1*U' <= 1e-12 (tight and scale-free, so the solution does not depend on
-// the starting values); it returns the number of iterations, Lc that of the solution
+// the starting values); it returns the number of iterations, Lc that of the solution,
+// and rc = 0, or 3498 (singular information) or 430 (no convergence, likelihood not
+// finite), in which case the caller refits stcox for this cluster
 real rowvector _stpaf_jknewton(struct stpaf_jk scalar JK, real matrix X, real colvector w,
-    real rowvector b0, real scalar it, real colvector Lc)
+    real rowvector b0, real scalar it, real colvector Lc, real scalar rc)
 {
     real rowvector b, bp, bn, U, Un, step
     real matrix I, In, Ii
@@ -1174,22 +1296,33 @@ real rowvector _stpaf_jknewton(struct stpaf_jk scalar JK, real matrix X, real co
     real scalar ll, lln, nr, h
 
     if (quadsum(w[JK.of, 1]) <= 0) _error(2000, "no failures left in a jackknife replicate")
+    rc = 0
     b = b0
     bp = b0
-    _stpaf_jkll(JK, X, w, b, ll, U, I, Lc)
     it = 0
+    _stpaf_jkll(JK, X, w, b, ll, U, I, Lc)
+    if (ll >= .) {
+        rc = 430
+        return(b)
+    }
     while (1) {
         Ii = invsym(I)
         if (diag0cnt(Ii)) {
-            _error(3498, "singular information matrix in a jackknife replicate; use option refit")
+            rc = 3498
+            return(b)
         }
         step = U*Ii
         nr = step*U'
+        if (nr >= .) {
+            rc = 430
+            return(b)
+        }
         if (it > 0) {
             if (mreldif(b, bp) <= 1e-12 & nr <= 1e-12) break
         }
         if (it >= 100) {
-            _error(430, "jackknife replicate did not converge in 100 Newton iterations; use option refit")
+            rc = 430
+            return(b)
         }
         bn = b + step
         _stpaf_jkll(JK, X, w, bn, lln, Un, In, Lcn)
@@ -1200,7 +1333,10 @@ real rowvector _stpaf_jknewton(struct stpaf_jk scalar JK, real matrix X, real co
             _stpaf_jkll(JK, X, w, bn, lln, Un, In, Lcn)
             h++
         }
-        if (lln >= .) _error(430, "jackknife replicate: log likelihood not finite")
+        if (lln >= .) {
+            rc = 430
+            return(b)
+        }
         bp = b
         b = bn
         ll = lln
@@ -1243,21 +1379,25 @@ real rowvector _stpaf_jkpaf(struct stpaf_jk scalar JK, real matrix X, real colve
     return(out)
 }
 
-// driver of the fast jackknife; writes the mean number of Newton iterations to the
-// Stata scalar itname, or -1 (and leaves TAB unchanged) when the model has tied failure
-// times and was not fitted with Breslow ties, so that Stata refits stcox instead
+// driver of the fast jackknife; writes the mean number of Newton iterations (over the
+// clusters fitted by Newton) to the Stata scalar itname, or -1 (and leaves TAB unchanged)
+// when the model has tied failure times and was not fitted with Breslow ties, so that
+// Stata refits stcox instead. nfname: number of clusters whose Newton fit failed; their
+// codes go to the Stata matrix flname and the replicate PAFs of the others to the external
+// __stpaf_PF (TAB unchanged), for Stata to refit those clusters and call _stpaf_jackfill
 void _stpaf_jackfast(real matrix X, real colvector t0, real colvector t1, real colvector d,
     real colvector g, real colvector w, real colvector clus, real colvector strat,
     real rowvector b, real scalar nsc, real rowvector tau, real scalar level,
     real scalar logci, string scalar tabname, real scalar warm, real scalar brestie,
-    string scalar itname)
+    string scalar itname, string scalar nfname, string scalar flname)
 {
     struct stpaf_dat scalar D
     struct stpaf_jk scalar JK
+    pointer() scalar pPF
     real matrix PF, Q1, Q0, mt
-    real colvector cnt, wj, Lc
+    real colvector cnt, wj, Lc, fl
     real rowvector bj, b0
-    real scalar G, nt, s, t, gg, it, itsum
+    real scalar G, nt, s, t, gg, it, itsum, nok, rcg
 
     D = _stpaf_prep(X, t0, t1, d, g, w, clus, strat, b)
     JK = _stpaf_jkset(X, D)
@@ -1266,6 +1406,7 @@ void _stpaf_jackfast(real matrix X, real colvector t0, real colvector t1, real c
         cnt = _stpaf_bsum(J(rows(JK.of), 1, 1), JK.inf, JK.kf, JK.Ktot)
         if (max(cnt) > 1) {
             st_numscalar(itname, -1)
+            st_numscalar(nfname, 0)
             return
         }
     }
@@ -1285,14 +1426,29 @@ void _stpaf_jackfast(real matrix X, real colvector t0, real colvector t1, real c
     b0 = (warm ? b : J(1, cols(b), 0))
     PF = J(G, nsc*nt, .)
     itsum = 0
+    nok = 0
+    fl = J(0, 1, .)
     for (gg = 1; gg <= G; gg++) {
         wj = w :* (clus :!= gg)
-        bj = _stpaf_jknewton(JK, X, wj, b0, it, Lc)
+        bj = _stpaf_jknewton(JK, X, wj, b0, it, Lc, rcg)
+        if (rcg) {
+            fl = fl \ gg
+            continue
+        }
         itsum = itsum + it
+        nok++
         PF[gg, .] = _stpaf_jkpaf(JK, X, wj, g, bj, Lc, nsc, Q1, Q0)
     }
+    st_numscalar(itname, (nok > 0 ? itsum/nok : 0))
+    st_numscalar(nfname, rows(fl))
+    if (rows(fl)) {
+        st_matrix(flname, fl)
+        pPF = findexternal("__stpaf_PF")
+        if (pPF == NULL) pPF = crexternal("__stpaf_PF")
+        *pPF = PF
+        return
+    }
     _stpaf_jkvar(PF, level, logci, tabname)
-    st_numscalar(itname, itsum/G)
 }
 
 // largest deviation (after removing a constant) between Stata's xb and ours

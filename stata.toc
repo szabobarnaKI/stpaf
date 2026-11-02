@@ -1,0 +1,6 @@
+v 3
+d Population attributable fraction after stcox (Cox and LWYY models)
+d The stpaf command estimates the population attributable fraction of possibly time-varying covariates after stcox, with influence-function or cluster-jackknife confidence intervals.
+d
+d Program by Barna Szabó-Söderberg
+p stpaf Population attributable fraction after stcox.

@@ -1,0 +1,9 @@
+v 3
+d Population attributable fraction after stcox (Cox and LWYY models)
+d The stpaf command estimates the population attributable fraction (PAF) of possibly time-varying covariates after stcox, for single events (Cox) and recurrent events (Lin-Wei-Yang-Ying), including Ghosh-Lin data prepared by ghoshlin. Confidence intervals come from an influence function or an exact cluster jackknife (the default with fewer than 100 clusters). Supports stset weights, strata, if-restricted person-time, several horizons and several counterfactual scenarios.
+d
+d Program by Barna Szabó-Söderberg
+d Distribution-Date: 2026.11.03
+f stpaf.ado
+f stpaf.sthlp
+a stpaf_cert.do

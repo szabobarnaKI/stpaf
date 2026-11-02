@@ -1,5 +1,5 @@
 {smcl}
-{* *! version 0.4.0  02nov2026}{...}
+{* *! version 0.5.1  03nov2026}{...}
 {vieweralsodisplay}
 {viewerjumpto "Syntax" "stpaf##syntax"}{...}
 {viewerjumpto "Description" "stpaf##description"}{...}
@@ -39,10 +39,10 @@ with influence-function or cluster-jackknife confidence intervals
 {synopt:{opt citr:ans(log|none)}}scale used for the CI; default {cmd:log}, i.e. log(1-PAF){p_end}
 
 {syntab:Variance}
-{synopt:{opt vce(if|jackknife)}}influence function (default) or exact cluster jackknife{p_end}
+{synopt:{opt vce(if|jackknife)}}influence function or exact cluster jackknife; default {cmd:jackknife} with fewer than 100 clusters, otherwise {cmd:if}{p_end}
 {synopt:{opt cl:uster(varname)}}cluster variable; default {cmd:e(clustvar)}, then the {cmd:stset} {opt id()}{p_end}
-{synopt:{opt nowarm}}{cmd:vce(jackknife)}: start each re-estimation from zero instead of {cmd:e(b)}{p_end}
-{synopt:{opt refit}}{cmd:vce(jackknife)}: refit {cmd:stcox} for each cluster (slower; method of version 0.3){p_end}
+{synopt:{opt nowarm}}jackknife: start each re-estimation from zero instead of {cmd:e(b)}{p_end}
+{synopt:{opt refit}}jackknife: refit {cmd:stcox} for each cluster (slower; method of version 0.3){p_end}
 {synopt:{opt nodots}}suppress the replication dots of {cmd:vce(jackknife)} with {opt refit}{p_end}
 {synoptline}
 {p2colreset}{...}
@@ -70,7 +70,9 @@ Confidence intervals come from a closed-form influence function that accounts fo
 uncertainty in the regression coefficients, in the Breslow baseline hazard and
 in the covariate distribution, and that sums contributions within clusters.
 No resampling is needed; the cost is a few passes through the data
-(O(n log n) for the sweeps).
+(O(n log n) for the sweeps).  With fewer than 100 clusters, where the influence-function
+interval is too narrow, the default is an exact cluster jackknife instead
+(see {opt vce()}).
 
 {pstd}
 Time-varying covariates are used exactly as they are stored in the (start, stop] records
@@ -101,14 +103,22 @@ Regression coefficients are always those of the full model.
 1 - (1-PAF)exp(±z se[log(1-PAF)]), which keeps the limits below 1.
 
 {phang}
-{opt vce(if|jackknife)} chooses the variance estimator.  {cmd:vce(if)}, the default, uses the
+{opt vce(if|jackknife)} chooses the variance estimator.  {cmd:vce(if)} uses the
 closed-form influence function (instantaneous).  {cmd:vce(jackknife)} re-estimates the model
 G times, each time leaving out one cluster (same terms, strata and {cmd:stset} weights),
 recomputes the PAF on each reduced sample, and uses the jackknife variance
 (G-1)/G sum (theta_(-g) - mean)^2 of log(1-PAF) for the log-scale CI and of PAF for the
-reported standard error.  It is recommended when there are fewer than about 100 clusters
-(see {help stpaf##performance:Performance}).
+reported standard error.
 {cmd:vce(jackknife)} is not available with {cmd:fweight}s and no clustering.
+
+{pmore}
+If {opt vce()} is not specified, the jackknife is used when there are fewer than 100 clusters
+(where the influence-function CI is too narrow; see {help stpaf##performance:Performance})
+and the influence function otherwise.  Either method can be requested explicitly whatever the
+number of clusters.  When the jackknife was chosen by default and cannot be computed (for
+example, an {it:if} restriction that lies within a single cluster leaves a reduced sample
+without expected events), {cmd:stpaf} displays a note with the error code and reports the
+influence-function results; an explicitly requested {cmd:vce(jackknife)} stops with the error instead.
 
 {pmore}
 By default the reduced-sample estimates are computed inside {cmd:stpaf} by Newton-Raphson
@@ -121,10 +131,15 @@ change in the log likelihood (Stata's {cmd:ltolerance()}) can be met after a sin
 has not yet reached the optimum.  With it, the solution does not depend on the starting values
 (see {opt nowarm}), and the estimates are the same as those of {cmd:stcox} refits up to the
 convergence tolerance of {cmd:stcox}.  The method is used when the model was fitted with
-{cmd:breslow} ties (the default of {cmd:stcox}) or when no failure times are tied (then
-{cmd:efron} and exact ties give the same likelihood); otherwise {cmd:stcox} is refitted
-and a note is displayed.  The number of clusters, the mean number of iterations and the
-method are shown in the output and stored in {cmd:r()}.
+{cmd:breslow} ties (the default of {cmd:stcox}), or when no failure times are tied (then
+{cmd:efron} and exact ties give the same likelihood); otherwise {cmd:stcox} is refitted for
+every cluster and a note is displayed.  ({cmd:stcox} allows no {cmd:stset} weights with
+{cmd:efron} ties, so weighted models always use the Newton jackknife.)  If the Newton fit fails for a cluster (singular
+information matrix, e.g. a covariate that is constant once the cluster is left out, or no
+convergence in 100 iterations), {cmd:stcox} is refitted for that cluster only, and a note
+is displayed; {cmd:stcox} then omits collinear terms as usual.  The number of clusters, the
+mean number of iterations, the number of {cmd:stcox} refits and the method are shown in the
+output and stored in {cmd:r()}.
 
 {phang}
 {opt nowarm} starts each jackknife re-estimation from zero instead of from {cmd:e(b)}.  The
@@ -135,6 +150,10 @@ results are the same (to about 1e-12); the option is provided to verify this and
 {opt refit} refits {cmd:stcox} for each left-out cluster instead (the method of {cmd:stpaf}
 0.3), using {cmd:stcox}'s own convergence criteria.  It is slower (G {cmd:stcox} fits) and is
 provided for checking.
+
+{pmore}
+{opt nowarm} and {opt refit} cannot be combined.  Without {opt vce()} either of them requests
+the jackknife whatever the number of clusters; with {cmd:vce(if)} they are not allowed.
 
 {phang}
 {opt nodots} suppresses the replication dots displayed by {cmd:vce(jackknife)} {opt refit}.
@@ -218,7 +237,11 @@ sample sizes, and the coverage of nominal 95% log-scale intervals was:
 With 50 clusters the clustered (sandwich) SE of the regression coefficient reported by
 {cmd:stcox} itself covered 0.89, i.e. the influence-function CI of {cmd:stpaf} behaves like
 the model's own robust variance.  The jackknife SE matched the empirical SD already with
-50 clusters.  {cmd:stpaf} displays a note when the default is used with fewer than 100 clusters.
+50 clusters.  Therefore, since version 0.5.0, the jackknife is the default with fewer than 100
+clusters; with {cmd:vce(if)} and fewer than 100 clusters a note is displayed.
+The Newton jackknife is fast: about 3 s for 400 clusters (1,641 recurrent events), and 12 s for 961
+clusters and 35,002 records (the Ghosh-Lin example below), against 26 s and 452 s for
+{cmd:stcox} refits.
 
 {marker weights}{...}
 {title:Weights}
@@ -258,8 +281,9 @@ Weights must not be negative.
 {phang2}{cmd:. stcox i.smoke age bmi, vce(cluster id)}{p_end}
 {phang2}{cmd:. stpaf, eliminate(smoke) horizon(1 2 3) each}{p_end}
 
-{pstd}Few clusters: exact cluster jackknife{p_end}
+{pstd}Exact cluster jackknife (the default with fewer than 100 clusters, e.g. clustering on centres){p_end}
 {phang2}{cmd:. stpaf, eliminate(smoke) vce(jackknife)}{p_end}
+{phang2}{cmd:. stpaf, eliminate(smoke) cluster(centre)}{p_end}
 
 {pstd}Ghosh-Lin model (recurrent events with a terminal event) after {cmd:ghoshlin}; run {cmd:stpaf} in the transformed frame{p_end}
 {phang2}{cmd:. sysuse ghoshlin_example, clear}{p_end}
@@ -291,11 +315,12 @@ Weights must not be negative.
 {synopt:{cmd:r(se_logR)}}standard error of log(1-PAF){p_end}
 {synopt:{cmd:r(N_clust)}}number of clusters{p_end}
 {synopt:{cmd:r(N_fail)}}number of failures{p_end}
-{synopt:{cmd:r(jk_iter)}}{cmd:vce(jackknife)} (Newton): mean number of iterations per cluster{p_end}
+{synopt:{cmd:r(jk_iter)}}jackknife (Newton): mean number of iterations per cluster fitted by Newton{p_end}
+{synopt:{cmd:r(jk_nrefit)}}jackknife (Newton): number of clusters refitted by {cmd:stcox} after a failed Newton fit{p_end}
 {p2col 5 16 20 2: Macros}{p_end}
 {synopt:{cmd:r(cfactual)}}counterfactual scenario{p_end}
 {synopt:{cmd:r(citrans)}}CI transformation{p_end}
-{synopt:{cmd:r(vce)}}{cmd:if} or {cmd:jackknife}{p_end}
+{synopt:{cmd:r(vce)}}{cmd:if} or {cmd:jackknife}, the method actually used{p_end}
 {synopt:{cmd:r(clustvar)}}cluster variable (empty if clustered on records){p_end}
 {synopt:{cmd:r(jk_method)}}{cmd:vce(jackknife)}: {cmd:newton}, {cmd:newton, nowarm} or {cmd:refit}{p_end}
 {p2col 5 16 20 2: Matrices}{p_end}

@@ -1,6 +1,6 @@
-* stpaf_cert.do  --  certification script for stpaf 0.4.0
+* stpaf_cert.do  --  certification script for stpaf 0.5.1
 * Run with stpaf.ado and stpaf.sthlp on the adopath (e.g. -adopath ++ "path/to/folder"-).
-* NOTE: written without access to a Stata session; please run it once and report any failure.
+* All 14 tests passed with stpaf 0.5.0 and 0.5.1 (Stata 19 MP, 3nov2026).
 *
 * What is checked
 *   1. E (model-expected events) equals the observed number of failures when nothing is restricted
@@ -18,7 +18,12 @@
 *  11. cluster(): precedence over e(clustvar)/stset id, coarser and non-nested clusters,
 *      missing values, and data stset like ghoshlin output ([pw=weight_c] without id())
 *  12. ties: efron without tied failure times uses the Newton jackknife; efron with tied
-*      failure times falls back to stcox refits; breslow with ties: Newton = refits
+*      failure times falls back to stcox refits; breslow with ties: Newton = refits;
+*      (d) information: stcox allows no stset weights with efron (if it ever does, stpaf refits)
+*  13. default variance: cluster jackknife with fewer than 100 clusters, influence function
+*      otherwise and when the default jackknife fails; vce(if) still allowed; refit/nowarm
+*      imply vce(jackknife)
+*  14. a cluster whose Newton fit fails (singular information) is refitted by stcox
 
 version 15.0
 clear all
@@ -277,14 +282,14 @@ assert reldif(r(paf), `paf0') < 1e-10 & reldif(r(se), `seif0') < 1e-10
 assert r(N_clust) == `G'
 * (c) coarser clusters (subjects nested): IF and jackknife run on 20 clusters
 gen int grp = 1 + mod(id, 20)
-qui stpaf, eliminate(z) cluster(grp)
+qui stpaf, eliminate(z) cluster(grp) vce(if)
 assert r(N_clust) == 20 & reldif(r(paf), `paf0') < 1e-10
 local se20 = r(se)
 qui stpaf, eliminate(z) cluster(grp) vce(jackknife) nodots
 assert r(N_clust) == 20
 local sejk20 = r(se)
 * (d) non-nested clusters (time-varying z): runs with a note, 2 clusters
-stpaf, eliminate(z) cluster(z)
+stpaf, eliminate(z) cluster(z) vce(if)
 assert r(N_clust) == 2
 * (e) missing cluster values are refused
 qui replace grp = . if e(sample) & sum(e(sample)) == 1
@@ -306,6 +311,66 @@ assert reldif(r(se), `seif0') < 1e-8
 restore
 di as txt "[ok] 11: cluster() (20 clusters: IF SE = " %6.4f `se20' ", jackknife SE = " %6.4f `sejk20' ///
     "); ghoshlin-type data need cluster() or vce(cluster)"
+
+* ---- 13. default variance
+qui stcox z age, strata(stratum) vce(cluster id) breslow
+gen int grp = 1 + mod(id, 20)
+qui stpaf, eliminate(z) cluster(grp) vce(jackknife)
+local sej = r(se)
+local slj = r(se_logR)
+qui stpaf, eliminate(z) cluster(grp) vce(if)
+assert "`r(vce)'" == "if"
+local sei = r(se)
+* (a) 20 clusters, no vce(): the jackknife
+qui stpaf, eliminate(z) cluster(grp)
+assert "`r(vce)'" == "jackknife" & "`r(jk_method)'" == "newton" & r(jk_nrefit) == 0
+assert reldif(r(se), `sej') < 1e-12 & reldif(r(se_logR), `slj') < 1e-12
+* (b) 400 clusters, no vce(): the influence function
+qui stpaf, eliminate(z)
+assert "`r(vce)'" == "if" & r(N_clust) == 400
+* (c) refit / nowarm without vce() request the jackknife, also with many clusters;
+*     with vce(if) they are refused, and they cannot be combined
+qui stpaf, eliminate(z) cluster(grp) refit nodots
+assert "`r(vce)'" == "jackknife" & "`r(jk_method)'" == "refit"
+assert reldif(r(se), `sej') < 1e-5
+qui stpaf, eliminate(z) nowarm
+assert "`r(vce)'" == "jackknife" & "`r(jk_method)'" == "newton, nowarm" & r(N_clust) == 400
+capture stpaf, eliminate(z) cluster(grp) vce(if) refit
+assert _rc == 198
+capture stpaf, eliminate(z) cluster(grp) refit nowarm
+assert _rc == 198
+* (d) the default jackknife fails (the restricted person-time lies in one cluster, so
+*     leaving it out leaves no expected events): influence function reported, no error;
+*     an explicit vce(jackknife) stops with the error
+qui stpaf if grp == 1, eliminate(z) cluster(grp) vce(if)
+local si1 = r(se)
+qui stpaf if grp == 1, eliminate(z) cluster(grp)
+assert "`r(vce)'" == "if" & reldif(r(se), `si1') < 1e-12
+capture stpaf if grp == 1, eliminate(z) cluster(grp) vce(jackknife)
+assert _rc == 2000
+di as txt "[ok] 13: default jackknife with 20 clusters (SE " %6.4f `sej' " vs IF " %6.4f `sei' ///
+    "), influence function with 400 clusters or when the default jackknife fails"
+
+* ---- 14. Newton failure in one replicate: that cluster is refitted by stcox
+* v is non-zero only in cluster 1, so leaving cluster 1 out makes the information singular
+* (stcox then omits v)
+gen double v = (grp == 1)*age
+qui stcox z age v, strata(stratum) vce(cluster id) breslow
+qui stpaf, eliminate(z) cluster(grp) vce(jackknife) nodots
+assert "`r(jk_method)'" == "newton" & r(jk_nrefit) == 1
+local sef = r(se)
+qui stpaf, eliminate(z) cluster(grp) vce(jackknife) nowarm nodots
+assert "`r(jk_method)'" == "newton, nowarm" & r(jk_nrefit) == 1
+assert reldif(r(se), `sef') < 1e-9
+qui stpaf, eliminate(z) cluster(grp) vce(jackknife) refit nodots
+assert reldif(r(se), `sef') < 1e-5
+qui stpaf, eliminate(z) cluster(grp) horizon(1 2.5) vce(jackknife) nodots
+matrix TN = r(table)
+qui stpaf, eliminate(z) cluster(grp) horizon(1 2.5) vce(jackknife) refit nodots
+matrix TR = r(table)
+assert mreldif(TN, TR) < 1e-5
+drop v grp
+di as txt "[ok] 14: failed Newton fit -> stcox refit for that cluster only; = full refits"
 
 * ---- 7. weights (single-record Cox data, no id: each record is its own cluster)
 clear
@@ -371,6 +436,26 @@ assert "`r(jk_method)'" == "newton"
 local sen = r(se)
 qui stpaf, eliminate(trt) vce(jackknife) refit nodots
 assert reldif(r(se), `sen') < 1e-5
-di as txt "[ok] 12: efron without ties -> Newton; efron with ties -> refit; breslow with ties: Newton = refit"
+* (d) efron with stset weights: Stata 19's stcox refuses fweights, iweights and pweights with
+*     efron (rc 101, 3nov2026). Kept as information; should a future stcox allow them, stpaf
+*     must refit, because fweights > 1 imply tied failures a count of failure records cannot see.
+gen byte w2 = 1 + (runiform() < .5)
+foreach wt in fweight iweight pweight {
+    foreach tv in t tr {
+        qui stset `tv' [`wt' = w2], failure(d)
+        capture qui stcox trt x, efron
+        local rcw = _rc
+        if `rcw' {
+            di as txt "[info] 12d: stcox does not allow `wt's with efron (rc = `rcw')"
+            continue, break
+        }
+        qui stpaf, eliminate(trt) vce(jackknife) cluster(idv) nodots
+        assert "`r(jk_method)'" == "refit"
+        di as txt "[info] 12d: stcox allows `wt's with efron (" ///
+            cond("`tv'" == "t", "no tied times", "tied times") "); stpaf refits"
+    }
+}
+di as txt "[ok] 12: efron without ties -> Newton; efron with ties -> refit; breslow with ties: Newton = refit;"
+di as txt "         stcox allows no weights with efron (see the [info] lines)"
 
 di as res _n "stpaf certification finished"
