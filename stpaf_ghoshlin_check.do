@@ -1,10 +1,11 @@
-* stpaf_ghoshlin_check.do -- compatibility checks of stpaf 0.4.0 with ghoshlin 1.3 (01nov2026)
+* stpaf_ghoshlin_check.do -- compatibility checks of stpaf 0.5.1 with ghoshlin 1.3 (01nov2026)
 * Needs stpaf.ado and ghoshlin.ado on the adopath. Uses ghoshlin_example.dta (961 subjects).
-* Written without access to Stata: please run once and report the first failure, if any.
+* All checks passed with stpaf 0.5.0 (Stata 19 MP, 3nov2026).
 *
 *  1. Ghosh-Lin data, vce(cluster ID): E = observed events, N_clust = subjects
 *  2. Analytic case: PAF among exposed = 1 - exp(-b)
-*  3. cluster() option: equals vce(cluster ID); guard after vce(robust); coarser clusters; missing values
+*  3. cluster() option: equals vce(cluster ID); guard after vce(robust); coarser clusters
+*     (with 50 clusters vce(jackknife) is the default); missing values
 *  4. IF vs vce(jackknife); Newton jackknife (warm, nowarm) vs stcox refits (set local refitcheck 0
 *     to skip the slow refits)
 *  5. Bootstrap with ghoshlin weights held fixed vs re-running ghoshlin in every replicate
@@ -79,18 +80,22 @@ frame gl {
     * (d) jackknife follows cluster()
     qui stpaf, eliminate(diabetes) cluster(ID) vce(jackknife) nodots
     local sejk_c = r(se)
-    * (e) coarser clusters (subjects nested): runs, fewer clusters
+    * (e) coarser clusters (subjects nested): runs, fewer clusters; 50 clusters: jackknife by default
     gen int _grp = mod(ID, 50)
-    qui stpaf, eliminate(diabetes) cluster(_grp)
-    assert r(N_clust) == 50
+    qui stpaf, eliminate(diabetes) cluster(_grp) vce(if)
+    assert r(N_clust) == 50 & "`r(vce)'" == "if"
     local se50 = r(se)
+    qui stpaf, eliminate(diabetes) cluster(_grp)
+    assert r(N_clust) == 50 & "`r(vce)'" == "jackknife" & "`r(jk_method)'" == "newton"
+    local sejk50 = r(se)
     * (f) missing cluster values are refused
     qui replace _grp = . if e(sample) & sum(e(sample)) == 1    // first estimation-sample row
     capture stpaf, eliminate(diabetes) cluster(_grp)
     assert _rc == 459
     drop _grp
 }
-di as txt "[ok] 3: cluster() = vce(cluster ID); guard after vce(robust); SE with 50 groups = " %7.4f `se50'
+di as txt "[ok] 3: cluster() = vce(cluster ID); guard after vce(robust); SE with 50 groups: IF " %7.4f `se50' ///
+    ", jackknife (default) " %7.4f `sejk50'
 
 * ---------------------------------------------------------------- 4. IF vs jackknife
 frame gl {
@@ -116,8 +121,8 @@ frame gl {
         assert "`r(jk_method)'" == "refit"
         assert reldif(`serf', `sejk') < 1e-5
     }
-    * (stcox allows no weights with efron ties, so ghoshlin data always use the Newton jackknife;
-    *  the efron fallback is tested in stpaf_cert.do, test 12)
+    * (stcox does not allow pweights with efron ties, so ghoshlin data always use the Newton
+    *  jackknife; the efron fallbacks are tested in stpaf_cert.do, test 12)
 }
 qui timer list
 di as txt "[info] 4: SE IF = " %7.4f `se1' "  SE jackknife = " %7.4f `sejk' ///

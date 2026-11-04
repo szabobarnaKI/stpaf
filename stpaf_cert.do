@@ -1,6 +1,7 @@
-* stpaf_cert.do  --  certification script for stpaf 0.5.1
+* stpaf_cert.do  --  certification script for stpaf 0.7.0
 * Run with stpaf.ado and stpaf.sthlp on the adopath (e.g. -adopath ++ "path/to/folder"-).
-* All 14 tests passed with stpaf 0.5.0 and 0.5.1 (Stata 19 MP, 3nov2026).
+* All 14 tests passed with stpaf 0.5.0, 0.5.1 and 0.6.0 (Stata 19 MP, 3nov2026); 0.7.0 adds test 15
+* (15/15 passed 3nov2026 08:34) and the exactm refit check in 12(e).
 *
 * What is checked
 *   1. E (model-expected events) equals the observed number of failures when nothing is restricted
@@ -17,13 +18,18 @@
 *  10. the same without strata (0.3.1 fix: vce(jackknife) failed for unstratified models)
 *  11. cluster(): precedence over e(clustvar)/stset id, coarser and non-nested clusters,
 *      missing values, and data stset like ghoshlin output ([pw=weight_c] without id())
-*  12. ties: efron without tied failure times uses the Newton jackknife; efron with tied
-*      failure times falls back to stcox refits; breslow with ties: Newton = refits;
-*      (d) information: stcox allows no stset weights with efron (if it ever does, stpaf refits)
+*  12. ties: efron without tied failure times: Newton = breslow; efron with tied failure
+*      times: Newton (Efron likelihood) = stcox refits, warm = cold; breslow with ties:
+*      Newton = refits; (d) information: stcox allows no stset weights with efron (if it ever
+*      does, stpaf refits); (e) exactm with tied failure times -> exactm refits (= explicit
+*      loop; 0.7.0 fix, e(ties) is "marginal"); (f) efron with ties,
+*      strata, delayed entry and coarser clusters (several leave-out failures per tie):
+*      Newton = refits for all columns of r(table)
 *  13. default variance: cluster jackknife with fewer than 100 clusters, influence function
 *      otherwise and when the default jackknife fails; vce(if) still allowed; refit/nowarm
 *      imply vce(jackknife)
 *  14. a cluster whose Newton fit fails (singular information) is refitted by stcox
+*  15. jackknife CIs use t(G-1) quantiles (log and none scales, level()); IF CIs stay normal
 
 version 15.0
 clear all
@@ -351,6 +357,25 @@ assert _rc == 2000
 di as txt "[ok] 13: default jackknife with 20 clusters (SE " %6.4f `sej' " vs IF " %6.4f `sei' ///
     "), influence function with 400 clusters or when the default jackknife fails"
 
+* ---- 15. jackknife CI with t(G-1) quantiles; influence function with normal quantiles
+qui stpaf, eliminate(z) cluster(grp) vce(jackknife) horizon(1 2.5)
+assert r(df) == 19
+matrix T = r(table)
+local q = invttail(19, .025)
+forvalues i = 1/2 {
+    local R = 1 - T[`i', 3]
+    assert reldif(T[`i', 5], 1 - `R'*exp(`q'*T[`i', 9])) < 1e-12
+    assert reldif(T[`i', 6], 1 - `R'*exp(-`q'*T[`i', 9])) < 1e-12
+}
+qui stpaf, eliminate(z) cluster(grp) vce(jackknife) citrans(none) level(90)
+local q = invttail(19, .05)
+assert reldif(r(lb), r(paf) - `q'*r(se)) < 1e-12 & reldif(r(ub), r(paf) + `q'*r(se)) < 1e-12
+qui stpaf, eliminate(z) cluster(grp) vce(if)
+assert "`r(df)'" == ""
+local q = invnormal(.975)
+assert reldif(r(lb), 1 - (1 - r(paf))*exp(`q'*r(se_logR))) < 1e-12
+di as txt "[ok] 15: jackknife CI with t(19) quantiles (" %5.3f invttail(19, .025) "), IF CI normal"
+
 * ---- 14. Newton failure in one replicate: that cluster is refitted by stcox
 * v is non-zero only in cluster 1, so leaving cluster 1 out makes the information singular
 * (stcox then omits v)
@@ -423,12 +448,33 @@ local sef = r(se)
 qui stcox trt x, breslow vce(cluster idv)
 qui stpaf, eliminate(trt) vce(jackknife)
 assert reldif(r(se), `sef') < 1e-9
-* (b) tied failure times, efron -> stcox refits (with a note)
+* (b) tied failure times, efron -> Newton with the Efron likelihood = stcox refits
 gen double tr = ceil(t*4)/4
 stset tr, id(idv) failure(d)
 qui stcox trt x, efron vce(cluster idv)
-stpaf, eliminate(trt) vce(jackknife) nodots
+timer clear
+timer on 1
+stpaf, eliminate(trt) vce(jackknife)
+timer off 1
+assert "`r(jk_method)'" == "newton" & r(jk_nrefit) == 0
+local seE = r(se)
+local slE = r(se_logR)
+local itE = r(jk_iter)
+qui stpaf, eliminate(trt) vce(jackknife) nowarm
+assert reldif(r(se), `seE') < 1e-9 & reldif(r(se_logR), `slE') < 1e-9
+assert r(jk_iter) > `itE'
+timer on 2
+qui stpaf, eliminate(trt) vce(jackknife) refit nodots
+timer off 2
 assert "`r(jk_method)'" == "refit"
+assert reldif(r(se), `seE') < 1e-5 & reldif(r(se_logR), `slE') < 1e-5
+* the Efron fit really differs from the Breslow one here (otherwise (b) tests nothing new)
+qui stcox trt x, breslow vce(cluster idv)
+qui stpaf, eliminate(trt) vce(jackknife)
+assert reldif(r(se), `seE') > 1e-4
+qui timer list
+di as txt "12b: efron with ties: Newton SE " %9.6f `seE' " (" %4.2f `itE' " it., " %5.2f r(t1) ///
+    "s)  refit " %5.2f r(t2) "s"
 * (c) tied failure times, breslow: Newton = refits
 qui stcox trt x, breslow vce(cluster idv)
 qui stpaf, eliminate(trt) vce(jackknife)
@@ -455,7 +501,54 @@ foreach wt in fweight iweight pweight {
             cond("`tv'" == "t", "no tied times", "tied times") "); stpaf refits"
     }
 }
-di as txt "[ok] 12: efron without ties -> Newton; efron with ties -> refit; breslow with ties: Newton = refit;"
+* (e) exactm with tied failure times -> stcox refits (20 clusters to keep it quick)
+gen int grp = 1 + mod(idv, 20)
+qui stset tr, id(idv) failure(d)
+* stcox allows no vce(robust/cluster) with exactm: the clusters go to stpaf
+qui stcox trt x, exactm
+di as txt "e(ties) after exactm: `e(ties)'"
+stpaf, eliminate(trt) vce(jackknife) cluster(grp) nodots
+assert "`r(jk_method)'" == "refit" & r(N_clust) == 20
+local sex = r(se)
+local slx = r(se_logR)
+* the refits must use exactm (0.6.0 and earlier refitted with breslow, because stcox stores
+* e(ties) = "marginal"): explicit loop of exactm refits; each replicate PAF is the point
+* estimate of stpaf after stcox on the reduced sample
+estimates store EXM
+matrix JKX = J(20, 1, .)
+forvalues c = 1/20 {
+    qui stcox trt x if grp != `c', exactm
+    qui stpaf, eliminate(trt) vce(if)
+    matrix JKX[`c', 1] = r(paf)
+}
+mata: st_local("sejkx", strofreal(sqrt(19/20*sum((st_matrix("JKX") :- mean(st_matrix("JKX"))):^2)), "%21.15g"))
+mata: st_local("sljkx", strofreal(sqrt(19/20*sum((ln(1 :- st_matrix("JKX")) :- mean(ln(1 :- st_matrix("JKX")))):^2)), "%21.15g"))
+di as txt "12e: exactm jackknife SE " %9.6f `sex' "  explicit exactm loop " %9.6f `sejkx'
+assert reldif(`sex', `sejkx') < 1e-8 & reldif(`slx', `sljkx') < 1e-8
+* and it differs from the breslow jackknife
+qui stcox trt x, breslow
+qui stpaf, eliminate(trt) vce(jackknife) cluster(grp) refit nodots
+assert reldif(r(se), `sex') > 1e-4
+estimates restore EXM
+* (f) efron with ties, strata, delayed entry and coarser clusters: Newton = refits
+gen byte sg = 1 + mod(idv, 2)
+gen double e0 = cond(mod(idv, 3) == 0, floor(4*runiform()*tr)/4, 0)
+qui stset tr, id(idv) failure(d) enter(time e0)
+qui count if _st & _t0 > 0
+assert r(N) > 0
+qui stcox trt x, efron strata(sg) vce(cluster grp)
+qui stpaf, eliminate(trt) cap(x=0) each horizon(0.5 1.5) vce(jackknife)
+assert "`r(jk_method)'" == "newton" & r(jk_nrefit) == 0
+matrix TN = r(table)
+qui stpaf, eliminate(trt) cap(x=0) each horizon(0.5 1.5) vce(jackknife) nowarm
+matrix TC = r(table)
+qui stpaf, eliminate(trt) cap(x=0) each horizon(0.5 1.5) vce(jackknife) refit nodots
+matrix TR = r(table)
+assert mreldif(TN, TC) < 1e-9
+assert mreldif(TN, TR) < 1e-5
+drop grp sg e0
+di as txt "[ok] 12: efron without ties: Newton = breslow; efron with ties: Newton (Efron) = refits;"
+di as txt "         breslow with ties: Newton = refit; exactm with ties -> refit;"
 di as txt "         stcox allows no weights with efron (see the [info] lines)"
 
 di as res _n "stpaf certification finished"
